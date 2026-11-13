@@ -1,0 +1,10 @@
+[project]
+name = "qucs-s-perf"
+version = "0.1.0"
+description = "Measurement tooling for a performance study of the Qucs-S GUI"
+license = { text = "GPL-2.0-or-later" }
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
