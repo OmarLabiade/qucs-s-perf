@@ -1,0 +1,227 @@
+diff --git a/qucs/CMakeLists.txt b/qucs/CMakeLists.txt
+index eb862441..e0b986ce 100755
+--- a/qucs/CMakeLists.txt
++++ b/qucs/CMakeLists.txt
+@@ -150,6 +150,7 @@ SET(QUCS_SRCS
+   symbolwidget.cpp wire_planner.cpp
+   qucsshortcutmanager.cpp
+   schematicvalidator.cpp
++  perf_bench.cpp
+ )
+ 
+ SET(QUCS_HDRS
+diff --git a/qucs/main.cpp b/qucs/main.cpp
+index 094d809f..91412919 100644
+--- a/qucs/main.cpp
++++ b/qucs/main.cpp
+@@ -43,6 +43,7 @@
+ 
+ #include "qucs.h"
+ #include "main.h"
++#include "perf_bench.h"
+ #include "node.h"
+ #include "printerwriter.h"
+ #include "imagewriter.h"
+@@ -1088,6 +1089,8 @@ int main(int argc, char *argv[])
+         {"list-entries", QCoreApplication::translate("main", "list component entry formats for schematic and netlist")},
+         {{"c", "netlist2Console"}, QCoreApplication::translate("main", "write netlist to console")},
+         {{"x", "spiceprefix"}, QCoreApplication::translate("main", "resolve spice prefix during netlist CDL")},
++        {"perf-bench", "run timed GUI operations on a schematic and print JSON (use --perf-bench=FILE)", "FILENAME"},
++        {"perf-bench-repeat", "samples per timed operation (default 20)", "NUMBER", "20"},
+     });
+ 
+     parser.process(cmdArgs);
+@@ -1154,6 +1157,11 @@ int main(int argc, char *argv[])
+     exit(0);
+ #endif
+ 
++    if (parser.isSet("perf-bench"))
++    {
++        return runPerfBench(app, parser.value("perf-bench"), parser.value("perf-bench-repeat").toInt());
++    }
++
+     if (parser.isSet("icons"))
+     {
+         createIcons();
+diff --git a/qucs/perf_bench.cpp b/qucs/perf_bench.cpp
+new file mode 100644
+index 00000000..b147eb00
+--- /dev/null
++++ b/qucs/perf_bench.cpp
+@@ -0,0 +1,157 @@
++// Timing hooks used by the external qucs-s-perf harness. Not part of upstream.
++#include "perf_bench.h"
++
++#include "main.h"
++#include "qucs.h"
++#include "schematic.h"
++#include "extsimkernels/spicecompat.h"
++
++#include <QApplication>
++#include <QElapsedTimer>
++#include <QJsonArray>
++#include <QJsonDocument>
++#include <QJsonObject>
++#include <QMessageBox>
++#include <QTimer>
++#include <QTabWidget>
++
++#include <cstdio>
++#include <cstdlib>
++
++namespace {
++
++double elapsedMs(const QElapsedTimer& timer)
++{
++    return static_cast<double>(timer.nsecsElapsed()) / 1e6;
++}
++
++// QWidget::repaint() paints synchronously, so the elapsed time is the cost
++// of one full Schematic::drawContents() pass plus the backing-store flush.
++double timedRepaint(Schematic* schematic)
++{
++    QElapsedTimer timer;
++    timer.start();
++    schematic->viewport()->repaint();
++    return elapsedMs(timer);
++}
++
++QJsonArray repaintSamples(Schematic* schematic, int repeat)
++{
++    QJsonArray samples;
++    for (int i = 0; i < repeat; ++i) {
++        samples.append(timedRepaint(schematic));
++    }
++    return samples;
++}
++
++} // namespace
++
++int runPerfBench(QApplication& app, const QString& schematicFile, int repeat)
++{
++    QElapsedTimer timer;
++
++    // The first-run simulator lookup opens modal dialogs; a headless run has
++    // nobody to dismiss them, so pin the related settings up front.
++    QucsSettings.firstRun = false;
++    QucsSettings.Qucsator = "qucsator_rf";
++    QucsSettings.DefaultSimulator = spicecompat::simNgspice;
++
++    // Any other modal dialog (bad file, read-only directory, ...) would block
++    // forever. Report it and abort instead.
++    auto* watchdog = new QTimer(&app);
++    QObject::connect(watchdog, &QTimer::timeout, [] {
++        if (QWidget* dialog = QApplication::activeModalWidget()) {
++            QString text = dialog->windowTitle();
++            if (auto* box = qobject_cast<QMessageBox*>(dialog)) {
++                text += ": " + box->text();
++            }
++            std::fprintf(stderr, "perf-bench: blocked by dialog: %s\n", qPrintable(text));
++            std::_Exit(3);
++        }
++    });
++    watchdog->start(100);
++
++    timer.start();
++    QucsMain = new QucsApp(false);
++    QucsMain->resize(1280, 800);
++    QucsMain->show();
++    app.processEvents();
++    const double startupMs = elapsedMs(timer);
++
++    // Load through the same entry point as File > Open.
++    timer.restart();
++    const bool loaded = QucsMain->gotoPage(schematicFile);
++    const double loadMs = elapsedMs(timer);
++
++    auto* schematic = dynamic_cast<Schematic*>(QucsMain->DocumentTab->currentWidget());
++    if (!loaded || schematic == nullptr) {
++        std::fprintf(stderr, "perf-bench: cannot load %s\n", qPrintable(schematicFile));
++        return 2;
++    }
++
++    // First paint after load, including pending layout and resize events.
++    timer.restart();
++    app.processEvents();
++    schematic->viewport()->repaint();
++    const double firstPaintMs = elapsedMs(timer);
++
++    QJsonObject result;
++    result["schema"] = 1;
++    result["file"] = schematicFile;
++    result["qt_version"] = QString::fromLatin1(qVersion());
++    result["qt_platform"] = QGuiApplication::platformName();
++    result["components"] = static_cast<qint64>(schematic->a_DocComps.size());
++    result["wires"] = static_cast<qint64>(schematic->a_DocWires.size());
++    result["nodes"] = static_cast<qint64>(schematic->a_DocNodes.size());
++    result["viewport_w"] = schematic->viewport()->width();
++    result["viewport_h"] = schematic->viewport()->height();
++    result["startup_ms"] = startupMs;
++    result["load_ms"] = loadMs;
++    result["first_paint_ms"] = firstPaintMs;
++
++    // Whole schematic visible: every element is inside the viewport.
++    schematic->showAll();
++    app.processEvents();
++    result["scale_fit"] = schematic->getScale();
++    result["paint_fit_ms"] = repaintSamples(schematic, repeat);
++
++    // Scale 1.0: only a small part of a large schematic is visible.
++    schematic->showNoZoom();
++    app.processEvents();
++    result["paint_1to1_ms"] = repaintSamples(schematic, repeat);
++
++    // Pan: one scroll step followed by a repaint, as when dragging the view.
++    QJsonArray pan;
++    for (int i = 0; i < repeat; ++i) {
++        timer.restart();
++        schematic->scrollRight(40);
++        schematic->viewport()->repaint();
++        pan.append(elapsedMs(timer));
++    }
++    result["pan_ms"] = pan;
++
++    // Zoom: alternate zoom-in / zoom-out steps around the viewport centre.
++    QJsonArray zoom;
++    for (int i = 0; i < repeat; ++i) {
++        timer.restart();
++        schematic->zoomBy(i % 2 == 0 ? 1.25 : 0.8);
++        schematic->viewport()->repaint();
++        zoom.append(elapsedMs(timer));
++    }
++    result["zoom_ms"] = zoom;
++
++    // Edit bookkeeping: every edit pushes a snapshot onto the undo stack.
++    QJsonArray snapshot;
++    for (int i = 0; i < repeat; ++i) {
++        timer.restart();
++        schematic->setChanged(true, true);
++        snapshot.append(elapsedMs(timer));
++    }
++    result["undo_snapshot_ms"] = snapshot;
++
++    std::puts(QJsonDocument(result).toJson(QJsonDocument::Compact).constData());
++    std::fflush(stdout);
++
++    // Skip the "save changes?" dialog and the settings write-back on exit.
++    std::_Exit(0);
++}
+diff --git a/qucs/perf_bench.h b/qucs/perf_bench.h
+new file mode 100644
+index 00000000..f340e353
+--- /dev/null
++++ b/qucs/perf_bench.h
+@@ -0,0 +1,13 @@
++// Timing hooks used by the external qucs-s-perf harness. Not part of upstream.
++#ifndef PERF_BENCH_H
++#define PERF_BENCH_H
++
++class QApplication;
++class QString;
++
++// Opens `schematicFile` in the regular main window, runs a fixed sequence of
++// timed GUI operations and prints one JSON object on stdout.
++// Returns the process exit code.
++int runPerfBench(QApplication& app, const QString& schematicFile, int repeat);
++
++#endif
