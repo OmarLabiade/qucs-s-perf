@@ -1,0 +1,18 @@
+# build trees and caches
+/build/
+/.cache/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# generated schematics are reproducible from scenarios/
+/scenarios/generated/
+
+# raw perf recordings are large; folded stacks and SVGs are kept
+*.perf.data
+*.perf.data.old
+
+# editor files
+.vscode/
+.idea/
+*.swp
